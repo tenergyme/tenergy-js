@@ -1,0 +1,61 @@
+{
+  "name": "@tenergy/sdk",
+  "version": "0.1.0-beta.0",
+  "description": "Typed TypeScript client for the tenergy energy API, generated from docs/api/openapi.yaml.",
+  "license": "MIT",
+  "author": "TEnergy",
+  "homepage": "https://tenergy.me/docs/sdk",
+  "keywords": [
+    "tron",
+    "trx",
+    "energy",
+    "energy-rental",
+    "bandwidth",
+    "usdt",
+    "trc20",
+    "sdk",
+    "api-client"
+  ],
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "generate": "openapi-typescript openapi.yaml --default-non-nullable false -o src/generated/openapi.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "openapi-typescript": "^7.4.4",
+    "postgres": "^3.4.5",
+    "typescript": "^5.6.3",
+    "undici": "^6.21.0",
+    "vitest": "^2.1.8"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tenergyme/tenergy-js.git"
+  },
+  "bugs": {
+    "url": "https://github.com/tenergyme/tenergy-js/issues"
+  }
+}
