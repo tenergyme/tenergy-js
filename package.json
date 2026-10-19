@@ -1,6 +1,6 @@
 {
   "name": "@tenergy/sdk",
-  "version": "0.1.0-beta.0",
+  "version": "0.1.0-beta.1",
   "description": "Typed TypeScript client for the tenergy energy API, generated from docs/api/openapi.yaml.",
   "license": "MIT",
   "author": "TEnergy",

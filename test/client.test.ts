@@ -231,6 +231,34 @@ describe('request signing on the wire', () => {
     expect(seen[3]!.headers['x-api-sign']).toBeDefined();
   });
 
+  it('calls the usage, daily market, JustLend, fee and account-fee routes at their paths (2026-10-09)', async () => {
+    const pool = agent.get(BASE);
+    pool
+      .intercept({ method: 'GET', path: (p: string) => p.startsWith(PREFIX) })
+      .reply(200, (opts) => {
+        seen.push({ method: String(opts.method), path: String(opts.path), headers: normalizeHeaders(opts.headers), body: '' });
+        return {};
+      }, { headers: { 'content-type': 'application/json' } })
+      .times(5);
+
+    const anonymous = new TenergyClient({ baseUrl: `${BASE}${PREFIX}`, now: () => FROZEN });
+    await anonymous.getAddressUsage('TQn9Y2khEsLJW1ChVWFMSMeRDow5KcbLSE', { days: '30' });
+    await anonymous.getMarketDaily({ days: 30 } as never);
+    await anonymous.getMarketJustLend();
+    await anonymous.getServiceFees();
+    for (const request of seen) expect(request.headers['x-api-key']).toBeUndefined();
+
+    await makeClient().getAccountFee();
+    expect(seen.map((r) => `${r.method} ${r.path}`)).toEqual([
+      `GET ${PREFIX}/resources/TQn9Y2khEsLJW1ChVWFMSMeRDow5KcbLSE/usage?days=30`,
+      `GET ${PREFIX}/market/daily?days=30`,
+      `GET ${PREFIX}/market/justlend`,
+      `GET ${PREFIX}/fees`,
+      `GET ${PREFIX}/account/fee`,
+    ]);
+    expect(seen[4]!.headers['x-api-sign']).toBeDefined();
+  });
+
   it('calls the market, status, plans, stats, deliveries and node-key routes at their paths (2026-10-05)', async () => {
     const pool = agent.get(BASE);
     pool
@@ -239,12 +267,13 @@ describe('request signing on the wire', () => {
         seen.push({ method: String(opts.method), path: String(opts.path), headers: normalizeHeaders(opts.headers), body: '' });
         return {};
       }, { headers: { 'content-type': 'application/json' } })
-      .times(10);
+      .times(11);
 
     const anonymous = new TenergyClient({ baseUrl: `${BASE}${PREFIX}`, now: () => FROZEN });
     await anonymous.getMarket();
     await anonymous.getMarketHistory({ hours: 24 } as never);
     await anonymous.getMarketSummary({ month: '2026-10' } as never);
+    await anonymous.getMarketHourlyPattern({ days: '7' });
     await anonymous.getStatus();
     await anonymous.listSubscriptionPlans();
     for (const request of seen) expect(request.headers['x-api-key']).toBeUndefined();
@@ -259,6 +288,7 @@ describe('request signing on the wire', () => {
       `GET ${PREFIX}/market`,
       `GET ${PREFIX}/market/history`,
       `GET ${PREFIX}/market/summary`,
+      `GET ${PREFIX}/market/hourly-pattern`,
       `GET ${PREFIX}/status`,
       `GET ${PREFIX}/subscriptions/plans`,
       `GET ${PREFIX}/account/stats`,
@@ -267,7 +297,7 @@ describe('request signing on the wire', () => {
       `POST ${PREFIX}/node-keys`,
       `DELETE ${PREFIX}/node-keys/nk_1`,
     ]);
-    expect(seen[5]!.headers['x-api-key']).toBe(KEY);
+    expect(seen[6]!.headers['x-api-key']).toBe(KEY);
   });
 
   it('refuses an authenticated call when it holds no key', async () => {

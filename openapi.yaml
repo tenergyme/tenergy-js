@@ -176,6 +176,12 @@ tags:
       Because the credential is a cookie, every unsafe method additionally needs the
       `X-CSRF-Token` header, whose value is the `csrf_token` of the session response. A
       cross-site page cannot read that response, so it cannot produce the header.
+  - name: OAuth
+    description: |
+      The person's side of AI-agent connections (OAuth 2.1). An agent starts at
+      `GET /oauth/authorize` on this host (metadata: `/.well-known/oauth-authorization-server`);
+      the dashboard's consent page reads the request, the person chooses permissions, spend
+      limits and expiry, and connected agents are listed, limited or revoked here.
   - name: Account
     description: Who am I, what is my balance, where do I send money.
   - name: Pricing
@@ -187,6 +193,13 @@ tags:
       queue and `created` is barely observable. `3002 order_not_cancellable` belongs to
       `POST /v1/batches/{id}/cancel`, where receivers that have already been picked up cannot
       be pulled back.
+  - name: Refills
+    description: |
+      Restore a receiver's USED energy or bandwidth now (it does not raise the limit). Bought from the
+      cheapest venue whose size range covers the amount; you pay the venue price plus your routing fee
+      (the same fee tiers as orders). Charged when created; once the venue reports, the part it did not
+      restore is refunded at the charged unit price. Uses the `orders.create` / `orders.read` scopes.
+      Answers `3033 refills_unavailable` while no venue is enabled on the deployment.
   - name: Batches
     description: One request, many receivers.
   - name: Subscriptions
@@ -200,6 +213,10 @@ tags:
     description: Managing the credentials of this account.
   - name: Node proxy
     description: Node keys for the TRON node proxy endpoint.
+  - name: Promo
+    description: |
+      The tenergy.app promo token: an address we dropped the token on claims one free energy grant, by signing a
+      message (no transaction, so its free bandwidth stays for the transfer) or by forwarding the token. Mainnet only.
 
 paths:
 
@@ -686,10 +703,19 @@ paths:
       operationId: createSessionHandoff
       summary: A single-use pass that opens the Nile cabinet without a second signature
       description: |
-        **Mainnet only, dashboard session only.** Signs a pass for the signed-in wallet's own address,
-        audience `nile`, valid 60 seconds and once. The Nile api accepts it at
-        `POST /session/handoff/accept`. One way only: nothing the Nile api issues opens a mainnet
-        session. `404` on a stack without the handoff key.
+        **Mainnet only, dashboard session only.** Signs a pass for the signed-in person, whatever
+        method they signed in with: the person, the sign-in method used, the person's verified wallets
+        and e-mails (no secrets) and the session's expiry; audience `nile`, valid 60 seconds and once.
+        The Nile api accepts it at `POST /session/handoff/accept`. One way only: nothing the Nile api
+        issues opens a mainnet session. `404` on a stack without the handoff key, or for a session
+        with no sign-in method on record.
+
+        The token is `<body>.<signature>`: base64url JSON, Ed25519-signed. Pass v2 body:
+        `{v: 2, typ: "session", iss: "mainnet", aud: "nile", jti, exp (60 s), brand,
+        person: {id, step_up}, identity: {id, kind, display}, subjects: [{kind, subject}], session_exp}`.
+        The same key signs two other types the site never asks for here: `step_up` (from
+        `POST /session/step-up/nile`) and `event` (mainnet to Nile: sign-out, a removed method); `typ`
+        is checked, so one type never serves as another.
       security:
         - DashboardSession: []
       responses:
@@ -713,10 +739,16 @@ paths:
       operationId: acceptSessionHandoff
       summary: Sign in to the Nile cabinet with a mainnet pass
       description: |
-        **Nile only.** Checks the pass (Ed25519 signature by the mainnet stack, audience `nile`, not
-        expired, not used before) and sets the session cookie for its address, opening an account on
-        Nile if the address has none — as `POST /session` does after a signature. `1003` when the pass
-        is refused; `404` on a stack that does not accept handoffs.
+        **Nile only.** Checks the pass (Ed25519 signature by the mainnet stack, audience `nile`, type,
+        brand, not expired, not used before) and sets the session cookie for the person it names,
+        opening their own Nile account at the first pass. The Nile session ends no later than the
+        mainnet session it came from. `1003` when the pass is refused; `404` on a stack that does not
+        accept handoffs.
+
+        On a Nile stack that accepts passes this is the ONLY way in: `POST /session`,
+        `/session/email/*`, `/session/telegram|google/start|callback` and `/session/identities*` answer
+        `404` there (the person signs in and manages sign-in methods on mainnet), and
+        `GET /session/methods` answers every method off with `sign_in_on: mainnet`.
       security: []
       requestBody:
         required: true
@@ -735,6 +767,790 @@ paths:
               schema: { $ref: "#/components/schemas/Session" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { description: Not accepted on this stack. }
+
+  /session/email/start:
+    post:
+      tags: [Session]
+      operationId: startEmailSignIn
+      summary: Send an e-mail sign-in code
+      description: |
+        Sends a six-digit code, valid 10 minutes, to the e-mail. **The answer is the same whether or
+        not the e-mail has an account**; when a code was sent less than a minute ago (or too many in
+        the last hour) nothing is sent and `retry_after` says how long to wait. A new code kills the
+        previous one. Rate-limited per IP (`1100`).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/EmailCodeStartRequest" }
+      responses:
+        "202":
+          description: Accepted.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EmailCodeStarted" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /session/email/verify:
+    post:
+      tags: [Session]
+      operationId: verifyEmailSignIn
+      summary: Sign in with an e-mail code
+      description: |
+        Checks the code and opens a browser session exactly as `POST /session` does (cookie,
+        `csrf_token`). An e-mail with no account gets one here: no owner wallet, the e-mail as its
+        owner's way in. `address` in the answer is `null`. `1016 login_code_invalid` carries
+        `details.attempts_left` (five guesses per code); `1017 login_code_expired` means request a
+        new code. Optional `first_touch` as on `POST /session`.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - { $ref: "#/components/schemas/EmailCodeVerifyRequest" }
+                - type: object
+                  properties:
+                    first_touch: { type: object }
+      responses:
+        "201":
+          description: Signed in. The session cookie is set.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "400":
+          description: "`1016 login_code_invalid`, `1017 login_code_expired`, or `2001 validation_failed`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /session/identities:
+    get:
+      tags: [Session]
+      operationId: listSessionIdentities
+      summary: The signed-in person's ways in
+      description: Wallet, e-mail and later Telegram/Google identities of the signed-in member, oldest first. **Dashboard session only.**
+      security:
+        - DashboardSession: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/Identity" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /session/identities/{id}:
+    delete:
+      tags: [Session]
+      operationId: deleteSessionIdentity
+      summary: Unlink a way in
+      description: |
+        Removes one identity of the signed-in member. `1019 last_identity` when it is the only one.
+        With 2-step on, needs a confirmation (`1020 step_up_required`). **Dashboard session only.**
+      security:
+        - DashboardSession: []
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { $ref: "#/components/parameters/StepUp" }
+      responses:
+        "204": { description: Unlinked. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: "`1020 step_up_required` (2-step on: approve, then repeat with `X-Step-Up`), `1021 step_up_invalid`, `1014 csrf_token_invalid`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: No such identity on this member.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: "`1019 last_identity`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /session/identities/email/start:
+    post:
+      tags: [Session]
+      operationId: startEmailLink
+      summary: Send a code to link an e-mail
+      description: |
+        As `POST /session/email/start`, for adding an e-mail to the signed-in member. With 2-step on,
+        needs a confirmation first (`1020 step_up_required`). **Dashboard session only.**
+      security:
+        - DashboardSession: []
+      parameters:
+        - { $ref: "#/components/parameters/StepUp" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/EmailCodeStartRequest" }
+      responses:
+        "202":
+          description: Accepted.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EmailCodeStarted" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: "`1020 step_up_required` (2-step on: approve, then repeat with `X-Step-Up`), `1021 step_up_invalid`, `1014 csrf_token_invalid`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+
+  /session/identities/email/verify:
+    post:
+      tags: [Session]
+      operationId: verifyEmailLink
+      summary: Link an e-mail with its code
+      description: |
+        Checks the code and adds the e-mail as a way in for the signed-in member. An e-mail that signs in to
+        another, EMPTY account (no balance, hold, orders, withdrawals, live keys, webhooks, node keys,
+        subscriptions, OAuth grants, other members) moves here: the answer carries `moved_from_empty_account`
+        and that account is closed when it has no way in left. Another account that is not empty is
+        `1023 identity_in_use_account_not_empty`; another member of this account is `1018 identity_taken`.
+        **Dashboard session only.**
+      security:
+        - DashboardSession: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/EmailCodeVerifyRequest" }
+      responses:
+        "201":
+          description: Linked.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Identity" }
+        "400":
+          description: "`1016 login_code_invalid`, `1017 login_code_expired`, or `2001 validation_failed`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409":
+          description: "`1023 identity_in_use_account_not_empty` (`details.reason`), `1018 identity_taken`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /session/identities/wallet/challenge:
+    post:
+      tags: [Session]
+      operationId: startWalletLink
+      summary: The message that links a wallet
+      description: |
+        The TIP-191 challenge of the wallet sign-in, issued with purpose `link`, for adding a TRON wallet to
+        the signed-in member. When the wallet already reaches another account (its wallet sign-in, a member
+        of another account, or an account it created) the link goes ahead only if that account is empty, as
+        for `verifyEmailLink`; otherwise `1023 identity_in_use_account_not_empty`. With 2-step on,
+        needs a confirmation first (`1020 step_up_required`). **Dashboard session only.**
+      security:
+        - DashboardSession: []
+      parameters:
+        - { $ref: "#/components/parameters/StepUp" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [address]
+              properties:
+                address: { $ref: "#/components/schemas/TronAddress" }
+      responses:
+        "201":
+          description: Issued; sign `message` in the wallet.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AccountChallenge" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: "`1020 step_up_required` (2-step on: approve, then repeat with `X-Step-Up`), `1021 step_up_invalid`, `1014 csrf_token_invalid`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: "`1023 identity_in_use_account_not_empty` (`details.reason`), `1018 identity_taken`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /session/identities/wallet/verify:
+    post:
+      tags: [Session]
+      operationId: verifyWalletLink
+      summary: Link a wallet with its signature
+      description: |
+        The signature over a `link` challenge adds the wallet as a way in for the signed-in member; a wallet
+        sign-in with it then opens this account. A wallet of another, empty account moves here (that account
+        loses the wallet as member address and `owner_address`, and is closed when no way in is left). A challenge issued for anything else, or a signature that
+        does not recover `address`, is `1010 challenge_invalid`. **Dashboard session only.**
+      security:
+        - DashboardSession: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AccountChallengeVerifyRequest" }
+      responses:
+        "201":
+          description: Linked.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Identity" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409":
+          description: "`1023 identity_in_use_account_not_empty` (`details.reason`), `1018 identity_taken`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /session/identities/wallet/ticket:
+    post:
+      tags: [Session]
+      operationId: linkWalletByTicket
+      summary: Link a wallet with the promo redeem's wallet ticket
+      description: |
+        The same as `POST /session/identities/wallet/verify`, with the `wallet_ticket` from `POST /promo/redeem`
+        in place of a signature: the person signed once, on the redeem page. A ticket is single-use, lives ten
+        minutes and is spent even when the link is refused. Unknown, expired or spent: `1010 challenge_invalid`.
+        **Dashboard session only.**
+      security:
+        - DashboardSession: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/WalletTicketRequest" }
+      responses:
+        "201":
+          description: Linked.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Identity" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409":
+          description: "`1023 identity_in_use_account_not_empty` (`details.reason`), `1018 identity_taken`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /session/wallet-ticket:
+    post:
+      tags: [Session]
+      operationId: createSessionByWalletTicket
+      summary: Sign in with the promo redeem's wallet ticket
+      description: |
+        A wallet sign-in (`POST /session`) with the `wallet_ticket` from `POST /promo/redeem` in place of a
+        signature: the wallet's own account, or a new wallet account for a first-time wallet. Single-use, ten
+        minutes. Unknown, expired or spent: `1010 challenge_invalid`.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/WalletTicketRequest" }
+      responses:
+        "201":
+          description: Signed in; the session cookie is set.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /session/identities/telegram/start:
+    post:
+      tags: [Session]
+      operationId: startTelegramLink
+      summary: Start linking Telegram
+      description: |
+        Answers the Telegram URL to open. Telegram returns the browser to `return_to` with `?linked=telegram`,
+        with `&moved=closed` (or `&moved=kept`) when it was taken over from another, empty account, or
+        `?signin_error=identity_in_use_account_not_empty|identity_taken|telegram`; the link needs this
+        browser's session at the callback.
+        404 while Telegram sign-in is off. With 2-step on, needs a confirmation first. **Dashboard session only.**
+      security:
+        - DashboardSession: []
+      parameters:
+        - { $ref: "#/components/parameters/StepUp" }
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/OidcLinkRequest" }
+      responses:
+        "200":
+          description: Where to send the browser.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OidcLinkStarted" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: "`1020 step_up_required`, `1021 step_up_invalid`, `1014 csrf_token_invalid`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /session/identities/google/start:
+    post:
+      tags: [Session]
+      operationId: startGoogleLink
+      summary: Start linking Google
+      description: |
+        As `startTelegramLink`, for a Google account; back with `?linked=google` or
+        `?signin_error=identity_in_use_account_not_empty|identity_taken|google`. 404 while Google sign-in is off. **Dashboard session only.**
+      security:
+        - DashboardSession: []
+      parameters:
+        - { $ref: "#/components/parameters/StepUp" }
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/OidcLinkRequest" }
+      responses:
+        "200":
+          description: Where to send the browser.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OidcLinkStarted" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: "`1020 step_up_required`, `1021 step_up_invalid`, `1014 csrf_token_invalid`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /session/methods:
+    get:
+      tags: [Session]
+      operationId: getSignInMethods
+      summary: Which sign-in methods this API offers
+      description: |
+        Telegram and Google are each off until their OAuth client is configured. Anonymous. On a Nile
+        stack that takes mainnet passes every method is off and `sign_in_on: mainnet`: sign in on the
+        mainnet API, then hand the session over (`POST /session/handoff`).
+      security: []
+      responses:
+        "200":
+          description: The methods.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SignInMethods" }
+
+  /session/telegram/start:
+    get:
+      tags: [Session]
+      operationId: startTelegramSignIn
+      summary: Sign in with Telegram
+      description: |
+        A browser navigation: sets a signed, HttpOnly flow cookie (state, nonce, PKCE verifier) and answers
+        302 to Telegram's OpenID Connect authorization endpoint. 404 while Telegram sign-in is off.
+      security: []
+      parameters:
+        - { $ref: "#/components/parameters/OidcReturnTo" }
+        - { $ref: "#/components/parameters/OidcFirstTouch" }
+      responses:
+        "302": { description: To Telegram. }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /session/telegram/callback:
+    get:
+      tags: [Session]
+      operationId: telegramSignInCallback
+      summary: Telegram's redirect back
+      description: |
+        Exchanges the code (PKCE), verifies the ID token (RS256 against Telegram's JWKS; `iss`, `aud`, `exp`,
+        `nonce`) and signs in — a new Telegram account opens a new account — or links it, then 302 to the
+        site path the flow started from (`?signin_error=telegram|identity_taken` on failure).
+      security: []
+      parameters:
+        - { name: code, in: query, schema: { type: string } }
+        - { name: state, in: query, schema: { type: string } }
+        - { name: error, in: query, schema: { type: string } }
+      responses:
+        "302": { description: Back to the site. }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /session/google/start:
+    get:
+      tags: [Session]
+      operationId: startGoogleSignIn
+      summary: Sign in with Google
+      description: |
+        As `startTelegramSignIn`, to Google (scope `openid email profile`, PKCE S256, nonce). 404 while Google
+        sign-in is off.
+      security: []
+      parameters:
+        - { $ref: "#/components/parameters/OidcReturnTo" }
+        - { $ref: "#/components/parameters/OidcFirstTouch" }
+      responses:
+        "302": { description: To Google. }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /session/google/callback:
+    get:
+      tags: [Session]
+      operationId: googleSignInCallback
+      summary: Google's redirect back
+      description: |
+        As `telegramSignInCallback`; the ID token is checked against Google's JWKS with `iss`
+        `https://accounts.google.com` or `accounts.google.com`. The identity is the Google `sub`: a Google
+        account whose e-mail equals an e-mail sign-in here is not joined to it — signing in opens a new
+        account; link it from inside instead.
+      security: []
+      parameters:
+        - { name: code, in: query, schema: { type: string } }
+        - { name: state, in: query, schema: { type: string } }
+        - { name: error, in: query, schema: { type: string } }
+      responses:
+        "302": { description: Back to the site. }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /session/step-up:
+    get:
+      tags: [Session]
+      operationId: getStepUp
+      summary: The 2-step channel
+      description: |
+        Which second channel confirms risky actions of the signed-in person (withdrawals, API key
+        creation, linking and unlinking sign-in methods, changing this setting) and which channels
+        they can choose now. `off` until the person switches it on. **Dashboard session only.**
+      security:
+        - DashboardSession: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StepUpState" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    put:
+      tags: [Session]
+      operationId: setStepUp
+      summary: Choose the 2-step channel
+      description: |
+        `email` needs an address that can receive codes (a verified e-mail sign-in method, or a Google
+        account whose address Google verified), `wallet` a linked wallet, `telegram` a linked Telegram account
+        with the bot configured on this deployment (`1022 step_up_channel_unavailable` otherwise).
+        `identity_id` (e-mail only) picks the address among `emails`. Switching on from `off` needs no
+        confirmation: every channel was proven at sign-in. Switching off, to another channel or to another
+        address is confirmed once, through the CURRENT channel: `1020 step_up_required`, approved and repeated
+        with `X-Step-Up`. A code that went to the same place under 15 s ago and is still unused answers
+        `1100 rate_limited` with `details.scope: step_up` and `details.retry_after`. Choosing `telegram`, the bot
+        writes that confirmation is on; when it cannot write to the person (Start never pressed, or the bot
+        blocked) the answer is `1025 telegram_bot_not_started` with `details.bot_username` and nothing changes; a Telegram account linked before the bot could be granted access answers `1026 telegram_relink_needed` (link it again).
+        On Nile, a session opened by a mainnet pass cannot change it: `1022` with `details.reason:
+        set_on_mainnet` (the channel is the person's, chosen on mainnet, and confirms Nile actions too).
+        **Dashboard session only.**
+      security:
+        - DashboardSession: []
+      parameters:
+        - { $ref: "#/components/parameters/StepUp" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [channel]
+              properties:
+                channel: { type: string, enum: ["off", email, telegram, wallet] }
+                identity_id: { type: string, description: "E-mail only: the `emails[].identity_id` codes go to." }
+      responses:
+        "200":
+          description: Saved.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StepUpState" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: "`1020 step_up_required` (2-step on: approve, then repeat with `X-Step-Up`), `1021 step_up_invalid`, `1014 csrf_token_invalid`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: "`1022 step_up_channel_unavailable`, `1025 telegram_bot_not_started`, `1026 telegram_relink_needed`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /session/step-up/nile:
+    post:
+      tags: [Session]
+      operationId: confirmNileStepUp
+      summary: Confirm a Nile action through the person's mainnet channel
+      description: |
+        **Mainnet only, dashboard session only.** A Nile session opened by a mainnet pass answers a
+        protected action with `1020 step_up_required` and `details.via: mainnet`, `step_up_id`,
+        `payload_hash`, `action_label`. The page sends those here: the first call answers `1020` with a
+        MAINNET request through the person's own channel (or the choose-channel answer when none is set);
+        approved and repeated with `X-Step-Up`, it answers a 60 s single-use step-up pass bound to that
+        Nile request id and payload hash. The page then approves the Nile request with
+        `POST /step-up/{id}/approve {pass}` on Nile and repeats the action there. `404` on a stack
+        without the handoff key.
+      security:
+        - DashboardSession: []
+      parameters:
+        - { $ref: "#/components/parameters/StepUp" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [request_id, payload_hash]
+              properties:
+                request_id: { type: string, maxLength: 64, description: "`details.step_up_id` of the Nile `1020`." }
+                payload_hash: { type: string, pattern: "^[0-9a-f]{64}$", description: "`details.payload_hash` of the Nile `1020`." }
+                action_label: { type: string, maxLength: 200, description: "What the Nile action is; shown to the person only." }
+      responses:
+        "200":
+          description: The step-up pass.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [pass, expires_at]
+                properties:
+                  pass: { type: string }
+                  expires_at: { type: string, format: date-time }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: "`1020 step_up_required` (approve on mainnet, then repeat with `X-Step-Up`), `1021 step_up_invalid`, `1014 csrf_token_invalid`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404": { description: Not offered on this stack. }
+
+  /step-up/{id}/approve:
+    post:
+      tags: [Session]
+      operationId: approveStepUp
+      summary: Approve one 2-step confirmation
+      description: |
+        `id` is `details.step_up_id` of a `1020 step_up_required` answer. E-mail and Telegram channels: the
+        six-digit `code` from the mail or the bot's message. Wallet channel: `signature`, TIP-191 over
+        `details.message`, from a wallet linked to this person. The approval is valid until
+        `expires_at` (5 minutes from the request) for one repeat of the identical request with
+        `X-Step-Up: <id>`. **Dashboard session only.**
+      security:
+        - DashboardSession: []
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/StepUpApproveRequest" }
+      responses:
+        "200":
+          description: Approved.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StepUpApproved" }
+        "400":
+          description: "`1016 login_code_invalid`, `1017 login_code_expired`, or `2001 validation_failed`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: "`1021 step_up_invalid`: unknown, not pending, expired, or a signature from no linked wallet."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /oauth/requests/{requestId}:
+    get:
+      tags: [OAuth]
+      operationId: getOAuthRequest
+      summary: An agent's authorization request, for the consent page
+      description: |
+        What an AI agent asked for through `GET /oauth/authorize`: the client (name, host, where
+        its metadata came from), the requested permissions, the resource the token is for, and the
+        defaults the page pre-fills. `api_keys.manage` and `webhooks.manage` are opt-in
+        (`opt_in: true`, unchecked). Live for ten minutes and until decided. **Dashboard session only.**
+      security:
+        - DashboardSession: []
+      parameters:
+        - { name: requestId, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OAuthRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: "`3029 oauth_request_not_found`: unknown, decided, or expired."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /oauth/requests/{requestId}/decision:
+    post:
+      tags: [OAuth]
+      operationId: decideOAuthRequest
+      summary: Approve or deny an agent's authorization request
+      description: |
+        `approve: true` creates the grant with the chosen `scopes` (a subset of the requested ones)
+        and a one-time code, and answers the client URL to send the browser to
+        (`code`, `state`, `iss`). `approve: false` answers the client URL with
+        `error=access_denied`. Granting `orders.create` needs both spend limits (omitted = 100 TRX
+        a day and 1,000 TRX a month; `null` is refused). `expires_in_days` omitted or `null` =
+        no expiry. With 2-step on, a grant holding `orders.create`, `api_keys.manage` or
+        `webhooks.manage` answers `1020 step_up_required` first. Ordering and managing keys or
+        webhooks need the `editor` role. **Dashboard session only.**
+      security:
+        - DashboardSession: []
+      parameters:
+        - { name: requestId, in: path, required: true, schema: { type: string } }
+        - { $ref: "#/components/parameters/StepUp" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/OAuthDecisionRequest" }
+      responses:
+        "200":
+          description: Decided; send the browser to `redirect_to`.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [redirect_to]
+                properties:
+                  redirect_to: { type: string, format: uri }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: "`1020 step_up_required`, `1021 step_up_invalid`, `1005 insufficient_scope` (role), `1014 csrf_token_invalid`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: "`3029 oauth_request_not_found`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /oauth/grants:
+    get:
+      tags: [OAuth]
+      operationId: listOAuthGrants
+      summary: Connected agents
+      description: The account's live agent grants (not revoked, not expired), newest first. **Dashboard session only.**
+      security:
+        - DashboardSession: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/OAuthGrant" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /oauth/grants/{grantId}:
+    patch:
+      tags: [OAuth]
+      operationId: updateOAuthGrant
+      summary: Change a connected agent's limits or expiry
+      description: |
+        Lowering a limit or shortening the expiry applies at once; raising a limit, extending the
+        expiry or removing it needs a step-up when 2-step is on. Spend limits exist only on a grant
+        holding `orders.create` and cannot be removed. The person who connected the agent or the
+        account owner. **Dashboard session only.**
+      security:
+        - DashboardSession: []
+      parameters:
+        - { name: grantId, in: path, required: true, schema: { type: string } }
+        - { $ref: "#/components/parameters/StepUp" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/OAuthGrantPatch" }
+      responses:
+        "200":
+          description: Saved.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OAuthGrant" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: "`1020 step_up_required`, `1021 step_up_invalid`, `1005 insufficient_scope`, `1014 csrf_token_invalid`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: "`3030 oauth_grant_not_found`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422":
+          description: "`2002 empty_patch`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    delete:
+      tags: [OAuth]
+      operationId: revokeOAuthGrant
+      summary: Disconnect an agent
+      description: Revokes the grant and every token it issued, at once. **Dashboard session only.**
+      security:
+        - DashboardSession: []
+      parameters:
+        - { name: grantId, in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: Revoked. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: "`1005 insufficient_scope` (not yours and not the owner), `1014 csrf_token_invalid`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: "`3030 oauth_grant_not_found`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /session/history:
     get:
@@ -893,9 +1709,12 @@ paths:
 
         Most withdrawals are paid out automatically within a minute. A large one, or one above
         what the account has paid in, waits for a manual check first (`awaiting_approval`).
-        Signed-in owner only; not available with an API key.
+        Signed-in owner only; not available with an API key. With 2-step on, needs a confirmation
+        bound to this amount and destination (`1020 step_up_required`).
       security:
         - DashboardSession: []
+      parameters:
+        - { $ref: "#/components/parameters/StepUp" }
       requestBody:
         required: true
         content:
@@ -912,6 +1731,11 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Withdrawal" }
+        "403":
+          description: "`1020 step_up_required` (2-step on: approve, then repeat with `X-Step-Up`), `1021 step_up_invalid`, `1014 csrf_token_invalid`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
     get:
       tags: [Account]
       operationId: listWithdrawals
@@ -1024,6 +1848,79 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /account/fee:
+    get:
+      tags: [Account]
+      operationId: getAccountFee
+      summary: The service fee this account pays
+      description: |
+        The rate the next order is charged, the 30-day spend that set it, the next tier and an active promo
+        code. Tiers are by spend over the last 30 days, rolling; a promo code applies when its rate is lower.
+      security: [{ apiKey: [] }, { session: [] }]
+      responses:
+        "200":
+          description: The fee
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AccountFee" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /account/promo:
+    post:
+      tags: [Account]
+      operationId: redeemPromoCode
+      summary: Apply a promo code
+      description: |
+        Sets the account's service fee to the code's rate for the code's term (30 days by default), unless the
+        tier by volume is lower. One code is active at a time: a new code replaces the old one. Entering the
+        active code again changes nothing. Refusals: `3027 promo_not_found` (404) and `3028 promo_unavailable`
+        (409) with `details.reason`: `inactive`, `not_started`, `ended` or `used_up`. Dashboard sign-in only.
+      security: [{ session: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code: { type: string, minLength: 4, maxLength: 32 }
+      responses:
+        "200":
+          description: The fee after the code
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AccountFee" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /fees:
+    get:
+      tags: [Pricing]
+      operationId: getServiceFees
+      summary: The service fee tiers
+      description: |
+        Public. The service fee is a percentage of the provider price, by the account's spend over the last
+        30 days. A buyer without history pays the first tier. Market prices (`/prices`, `/market`) are before it.
+      security: []
+      responses:
+        "200":
+          description: The tiers in force
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tiers]
+                properties:
+                  tiers:
+                    type: array
+                    items: { $ref: "#/components/schemas/FeeTier" }
         "500": { $ref: "#/components/responses/InternalError" }
 
   /account/addresses:
@@ -1351,16 +2248,209 @@ paths:
                     type: array
                     items:
                       type: object
-                      required: [ts, price_sun_1h, price_sun_1d, available_energy]
+                      required: [ts, price_sun_1h, price_sun_1d, bandwidth_sun_1h, bandwidth_sun_1d, available_energy]
                       properties:
                         ts: { type: string, format: date-time }
                         price_sun_1h: { type: [number, "null"] }
                         price_sun_1d: { type: [number, "null"] }
+                        bandwidth_sun_1h: { type: [number, "null"], description: SUN per bandwidth unit for 1 hour; null where the provider publishes none. }
+                        bandwidth_sun_1d: { type: [number, "null"], description: SUN per bandwidth unit for 1 day; null where the provider publishes none. }
                         available_energy: { type: [integer, "null"] }
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "429": { $ref: "#/components/responses/RateLimited" }
         "500": { $ref: "#/components/responses/InternalError" }
+  /market/justlend:
+    get:
+      tags: [Pricing]
+      operationId: getMarketJustLend
+      summary: What a JustLend rental costs its renter
+      description: |
+        Inputs of the JustLend rental calculator: the rent rate (SUN per energy per day at 65,000
+        energy, the 0.75-day charge for used energy not included), energy per staked TRX, the
+        contract owner's energy today (the owner pays `100 - caller_share_pct` % of each call's
+        energy, at most `origin_energy_limit`, while it has energy left) and the chain burn prices.
+        `calls` are medians of mainnet receipts for the whole call (owner and caller together),
+        dated `measured_on`. Read live at most once a minute; when the node fails, the last good
+        read is served with `stale: true` for 15 minutes, then 503.
+      security:
+        - {}
+        - ApiKeyAuth: []
+          ApiTimestamp: []
+          ApiSign: []
+      responses:
+        "200":
+          description: The current state.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [as_of, stale, rate_sun_per_energy_day, energy_per_trx, consumed_charge_days, deposit_days, owner, burn, calls]
+                properties:
+                  as_of: { type: string, format: date-time }
+                  stale: { type: boolean }
+                  rate_sun_per_energy_day: { type: number }
+                  energy_per_trx: { type: number }
+                  consumed_charge_days: { type: number, description: Days of rent kept when the rental is returned with its energy used up. }
+                  deposit_days: { type: number, description: Days of rent taken as a deposit on top of the hold, refunded at the return. }
+                  owner:
+                    type: object
+                    required: [address, energy_limit, energy_used, caller_share_pct, origin_energy_limit]
+                    properties:
+                      address: { type: string }
+                      energy_limit: { type: integer }
+                      energy_used: { type: integer }
+                      caller_share_pct: { type: integer }
+                      origin_energy_limit: { type: integer }
+                  burn:
+                    type: object
+                    required: [energy_sun, bandwidth_sun]
+                    properties:
+                      energy_sun: { type: integer, description: getEnergyFee }
+                      bandwidth_sun: { type: integer, description: getTransactionFee, per byte }
+                  calls:
+                    type: object
+                    required: [rent, return, measured_on]
+                    properties:
+                      rent: { $ref: "#/components/schemas/JustLendCallCost" }
+                      return: { $ref: "#/components/schemas/JustLendCallCost" }
+                      measured_on: { type: string, format: date }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/InternalError" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+  /market/hourly-pattern:
+    get:
+      tags: [Pricing]
+      operationId: getMarketHourlyPattern
+      summary: Price windows by hour of day
+      description: |
+        The median 1 h price per UTC hour of day over the last 1, 7 or 30 days - ours (`tenergy`)
+        and the listed venues together - and our hours merged into windows of one price, labelled by
+        where that price sits between the day's lowest and highest (`cheapest`, `low`, `rising`,
+        `peak`; one price all day is `flat`). `cheapest` is our lowest hour and what 65,000 energy (one
+        USDT transfer) costs then. Hours with no data are null and split windows. Cached for 1 minute.
+      security:
+        - {}
+        - ApiKeyAuth: []
+          ApiTimestamp: []
+          ApiSign: []
+      parameters:
+        - { name: days, in: query, required: false, schema: { type: string, enum: ["1", "7", "30"], default: "7" } }
+        - name: compare
+          in: query
+          required: false
+          description: A venue's slug from `GET /v1/market`; its median 1 h price per hour comes back as `compare_median_1h`.
+          schema: { type: string, pattern: "^[a-z0-9-]{1,64}$" }
+        - name: basis
+          in: query
+          required: false
+          description: >-
+            `history` (default): medians over the last `days`. `forecast`: our 1 h price per UTC hour for the next 24 h
+            (hours before the current one are tomorrow's): the weighted median of that hour over the last 21 days of the
+            same type - weekdays, or Saturday and Sunday - the newest day weighing most, halving every 2 such days;
+            `tenergy_low_1h` / `tenergy_high_1h` are the lowest / highest of the days used. The market column and
+            `compare` stay history over `days`.
+          schema: { type: string, enum: [history, forecast], default: history }
+      responses:
+        "200":
+          description: The hourly pattern.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [days, from, to, generated_at, hours, windows, cheapest]
+                properties:
+                  days: { type: integer }
+                  from: { type: string, format: date-time }
+                  to: { type: string, format: date-time }
+                  generated_at: { type: string, format: date-time }
+                  compare: { type: string, description: The venue asked for with `compare`. }
+                  basis: { type: string, enum: [history, forecast], description: What `tenergy_median_1h` and the windows are. }
+                  hours:
+                    type: array
+                    items:
+                      type: object
+                      required: [hour, tenergy_median_1h, market_median_1h]
+                      properties:
+                        hour: { type: integer, minimum: 0, maximum: 23 }
+                        tenergy_median_1h: { type: [number, "null"] }
+                        market_median_1h: { type: [number, "null"] }
+                        tenergy_low_1h:
+                          type: [number, "null"]
+                          description: The lowest of this hour's per-day medians of our price over the window - the low edge of a forecast for this hour.
+                        tenergy_high_1h:
+                          type: [number, "null"]
+                          description: The highest of them - the high edge.
+                        compare_median_1h:
+                          type: [number, "null"]
+                          description: Only with `compare` - that venue's median 1 h price in this hour.
+                  windows:
+                    type: array
+                    items:
+                      type: object
+                      required: [start_hour, end_hour, price_sun_1h, label]
+                      properties:
+                        start_hour: { type: integer, description: UTC hour the window starts at. }
+                        end_hour: { type: integer, description: UTC hour it ends at (exclusive, up to 24). }
+                        price_sun_1h: { type: number }
+                        label: { type: string, enum: [cheapest, low, rising, peak, flat] }
+                  cheapest:
+                    type: [object, "null"]
+                    required: [price_sun_1h, per_65k_sun, hours]
+                    properties:
+                      price_sun_1h: { type: number }
+                      per_65k_sun: { type: integer }
+                      hours: { type: array, items: { type: integer } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+  /market/daily:
+    get:
+      tags: [Pricing]
+      operationId: getMarketDaily
+      summary: The market day by day
+      description: |
+        One row per UTC day over the last `days` (today is partial): the median and the lowest 1 h price
+        across the listed venues, the venue with the lowest median that day, our median 1 h price, and how
+        many venues and readings it rests on. Our price is taken minute by minute: our own reading, or else
+        the cheapest of CatFee, Netts and SoHu in that minute. Cached for 1 minute.
+      security:
+        - {}
+        - ApiKeyAuth: []
+          ApiTimestamp: []
+          ApiSign: []
+      parameters:
+        - { name: days, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 90, default: 30 } }
+      responses:
+        "200":
+          description: The days, oldest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [from, to, days]
+                properties:
+                  from: { type: string, format: date-time }
+                  to: { type: string, format: date-time }
+                  days:
+                    type: array
+                    items:
+                      type: object
+                      required: [day, market_median_sun_1h, market_min_sun_1h, cheapest, ours_sun_1h, providers, readings]
+                      properties:
+                        day: { type: string, format: date }
+                        market_median_sun_1h: { type: [number, "null"] }
+                        market_min_sun_1h: { type: [number, "null"] }
+                        cheapest:
+                          type: [object, "null"]
+                          required: [slug, name, median_sun_1h]
+                          properties:
+                            slug: { type: string }
+                            name: { type: string }
+                            median_sun_1h: { type: [number, "null"] }
+                        ours_sun_1h: { type: [number, "null"] }
+                        providers: { type: integer }
+                        readings: { type: integer }
+        "400": { $ref: "#/components/responses/BadRequest" }
   /market/summary:
     get:
       tags: [Pricing]
@@ -1370,7 +2460,7 @@ paths:
         The month's collected prices per provider - every venue on the board plus `tenergy` - and the
         median 1 h price by UTC hour of day. Statistics cover ok readings with a price; `ok_share` is
         the share of readings that succeeded. For the current month `to` is the time of the request.
-        A future month or a malformed `month` is `400`. Cached for 5 minutes.
+        A future month or a malformed `month` is `400`. Cached for 1 minute.
       security:
         - {}
         - ApiKeyAuth: []
@@ -1607,6 +2697,47 @@ paths:
         "429": { $ref: "#/components/responses/RateLimited" }
         "500": { $ref: "#/components/responses/InternalError" }
 
+  /wallet-payments:
+    post:
+      tags: [Pricing]
+      operationId: createWalletPayment
+      summary: Build a wallet payment for any receiver
+      description: |
+        Pay from a connected wallet for any receiver, with no account, no memo and no unique amount. Returns an
+        UNSIGNED plain TRX transfer `payer → this brand's published address for the tier`, built by our node and
+        valid for 10 minutes. Sign it in the payer's wallet and broadcast it as it is: the energy goes to
+        `receiver`, priced at the block exactly like a "Send TRX" transfer to the same address.
+
+        The receiver is bound to the transaction hash (`txid`) of these bytes before they exist on chain. A
+        transfer built anywhere else has another hash and keeps the plain rule (energy to the sender). Nothing is
+        charged until the signed transfer is on chain. Anonymous; a presented key only buys the per-key budget.
+      security:
+        - {}
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/WalletPaymentRequest" }
+            examples:
+              default:
+                value:
+                  payer: TYBSbQwqDgbdBghzsukTxFbTdR2nQ6u3ig
+                  receiver: TQn9Y2khEsLJW1ChVWFMSMeRDow5KcbLSE
+                  tier: 1h
+                  amount_sun: 1684000
+      responses:
+        "201":
+          description: Unsigned transfer built and its receiver bound
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WalletPayment" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "422": { $ref: "#/components/responses/UnprocessableEntity" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/InternalError" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+
   /quotes/{quoteId}:
     parameters:
       - name: quoteId
@@ -1631,6 +2762,272 @@ paths:
 
   # ---------------------------------------------------------------- Orders
 
+  /promo:
+    get:
+      tags: [Promo]
+      operationId: getPromo
+      summary: The promo token's current terms
+      description: |
+        Whether the promo is open now, today's cap and what is left of it, the grant, the token and the address a
+        holder may forward it to. `state: off` on a network with no promo (Nile); every other field is then null.
+        Cached for 15 s.
+      security: []
+      responses:
+        "200":
+          description: The terms.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Promo" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /promo/redeem/challenge:
+    post:
+      tags: [Promo]
+      operationId: createPromoRedeemChallenge
+      summary: The message to sign to claim the promo grant
+      description: |
+        The address challenge (see `POST /accounts/challenge`) under purpose `promo_redeem`. The claim is checked
+        BEFORE anything is signed — `3038 promo_not_eligible`, `3039 promo_already_redeemed`,
+        `3040 promo_redeem_unavailable` — so a wallet is never asked to sign for nothing.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [address]
+              properties:
+                address: { $ref: "#/components/schemas/TronAddress" }
+      responses:
+        "201":
+          description: Challenge issued.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AccountChallenge" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /promo/redeem:
+    post:
+      tags: [Promo]
+      operationId: redeemPromo
+      summary: Claim the promo grant with the signed challenge
+      description: |
+        One grant per address, whichever way it claims (signature or forwarding the token). A refused claim
+        records nothing. The grant is delegated within about a minute: poll `GET /promo/redemptions/{address}`.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AccountChallengeVerifyRequest" }
+      responses:
+        "201":
+          description: Claimed; the grant is on its way.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PromoRedeemResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /promo/dev/challenge:
+    post:
+      tags: [Promo]
+      operationId: createPromoDevChallenge
+      summary: The message to sign to claim a tenergy.dev promo code
+      description: |
+        For a wallet we dropped the tenergy.dev token on, on Nile. Checked before anything is signed:
+        `3038 promo_not_eligible` when Nile has no such drop; `3040 promo_redeem_unavailable` (state `off`) where
+        this promo is not set up; `5003 chain_unavailable` when the Nile drop log cannot be read. A wallet that
+        already has its code may sign again to see it. Purpose `promo_dev_code`.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [address]
+              properties:
+                address: { $ref: "#/components/schemas/TronAddress" }
+      responses:
+        "201":
+          description: Challenge issued.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AccountChallenge" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /promo/dev/claim:
+    post:
+      tags: [Promo]
+      operationId: claimPromoDevCode
+      summary: Claim the wallet's personal tenergy.dev promo code
+      description: |
+        One personal code per wallet: a 3 % routing fee for 30 days from when an account enters it
+        (`POST /account/promo`), to be entered by `activate_by`. The lower of the code and the account's volume tier
+        applies. 201 when issued now, 200 with the same code on any later claim. Never energy: a fee acts only on paid
+        orders.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AccountChallengeVerifyRequest" }
+      responses:
+        "200":
+          description: The code issued earlier.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PromoDevCode" }
+        "201":
+          description: Issued now.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PromoDevCode" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /promo/redemptions/{address}:
+    get:
+      tags: [Promo]
+      operationId: getPromoRedemption
+      summary: An address's claim and its grant
+      security: []
+      parameters:
+        - name: address
+          in: path
+          required: true
+          schema: { $ref: "#/components/schemas/TronAddress" }
+      responses:
+        "200":
+          description: The claim.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PromoRedemption" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /refills:
+    post:
+      tags: [Refills]
+      operationId: createRefill
+      summary: Create a refill
+      description: |
+        Quotes every enabled venue for `amount`, picks the lowest TOTAL cost (unit price x amount + the
+        venue's fixed fee) among venues whose size range covers `amount`, charges the balance and places
+        the order. One refill is one venue; it is never split.
+
+        Refused before any charge: `2008 amount_out_of_range` when `amount` is outside the accepted range
+        for the resource (`details.min_amount`, `details.max_amount`, also published in `GET /v1/prices`
+        under `refills`) or above what the receiver has used now (`details.restorable_max`);
+        `3036 nothing_to_refill` when the receiver has used nothing (or less than the smallest refill);
+        `3035 no_base_resource` when it has no limit at all; `3033 refills_unavailable` when no venue is
+        enabled or none answered.
+
+        `status`: `paid` (charged) -> `submitted` (venue order placed) -> `completed` (venue reported;
+        `restored_amount` set, the unrestored part refunded in `refunded_sun`) | `failed` (fully refunded).
+        Webhooks `refill.completed`, `refill.failed`. Idempotent on `client_order_id` / `Idempotency-Key`
+        like orders: the same body returns `200` and the original.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RefillRequest" }
+            examples:
+              energy:
+                summary: Restore 300k used energy
+                value:
+                  client_order_id: "acme-refill-000001"
+                  receiver: TQn9Y2khEsLJW1ChVWFMSMeRDow5KcbLSE
+                  resource: energy
+                  amount: 300000
+      responses:
+        "201":
+          description: Refill created and charged.
+          headers:
+            X-Request-Id: { $ref: "#/components/headers/XRequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Refill" }
+        "200":
+          description: Replay of an existing `client_order_id`; nothing charged.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Refill" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "402": { $ref: "#/components/responses/PaymentRequired" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/UnprocessableEntity" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/InternalError" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+    get:
+      tags: [Refills]
+      operationId: listRefills
+      summary: List refills
+      description: Newest first. Filters combine with AND.
+      parameters:
+        - { name: status, in: query, required: false, schema: { type: string }, description: "One or more of `paid`, `submitted`, `completed`, `failed`, comma-separated or repeated." }
+        - { name: resource, in: query, required: false, schema: { type: string, enum: [energy, bandwidth] } }
+        - { name: receiver, in: query, required: false, schema: { type: string } }
+        - { name: client_order_id, in: query, required: false, schema: { type: string } }
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 200 } }
+        - { name: cursor, in: query, required: false, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RefillList" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /refills/{refillId}:
+    parameters:
+      - name: refillId
+        in: path
+        required: true
+        description: The refill id (`rfl_...`) or `cid:<client_order_id>`.
+        schema: { type: string }
+    get:
+      tags: [Refills]
+      operationId: getRefill
+      summary: Refill detail
+      description: A `submitted` refill is brought up to date with its venue on every read.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Refill" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
   /orders:
     post:
       tags: [Orders]
@@ -1643,13 +3040,12 @@ paths:
 
         **The response is not a delivery receipt.** A `201` means the order was accepted, paid for
         and handed to the supply layer; `status` tells you how far it got by the time the response
-        was written. In the common case delivery is synchronous and you get back a delivered
-        order with `delegate_hash` populated within a few seconds — `status: "confirmed"` if
-        the response is written in the same instant the delivery is verified, `active`
-        thereafter, which is the value you will normally see. **Treat `confirmed` and `active`
-        alike: both mean the resource is on the receiver.** When the supply layer needs longer,
-        you get `status: "allocating"` and no hash yet — poll `GET /v1/orders/{id}` or, better,
-        subscribe to the `order.confirmed` webhook.
+        was written. The response is written as soon as the order is accepted and charged, so a
+        new order normally comes back `status: "paid"` with no `delegate_hash` yet (`allocating`
+        if the supply layer already started). Delivery follows within seconds: poll
+        `GET /v1/orders/{id}` (the SDKs' `waitForOrder` does) or, better, subscribe to the
+        `order.confirmed` webhook. **Treat `confirmed` and `active` alike: both mean the
+        resource is on the receiver.**
 
         **Check `partial`.** An order whose allocations only partly landed comes back
         `confirmed`/`active` with `partial: true`, `delivered_amount` below `amount` and the
@@ -1660,8 +3056,17 @@ paths:
         network timeout: retry verbatim rather than creating a second order.
 
         **Price protection.** Either pass `quote_id` (charged exactly the quoted total) or
-        `max_price_sun` (rejected with `3006 price_above_limit` if the live price is higher). With
+        `max_price_sun` (rejected with `3006 price_above_limit` if the live price is higher). Both
+        may be sent together: the ceiling is then checked against the quoted total. With
         neither, you are charged the live price whatever it is.
+
+        **Key spend limits.** A key with `daily_limit_sun` or `monthly_limit_sun` refuses an order that would take
+        it past either with `3026 api_key_spend_limit_reached`; nothing is charged. A replay of an existing
+        `client_order_id` is never refused by a limit.
+
+        **Agent spend limits.** An order placed with an AI agent's OAuth access token counts against that connected
+        agent's daily (UTC day) and monthly (UTC month) limits; one that would take it past either is refused with
+        `3031 spend_limit_reached` (HTTP 403, `details.resets_at`) and nothing is charged.
 
         **Activation.** If `receiver` is not activated on chain, the platform activates it and adds
         `activate_amount_sun` to the charge. Set `activate: false` to refuse that: the order is
@@ -2795,6 +4200,61 @@ paths:
         "500": { $ref: "#/components/responses/InternalError" }
         "503": { $ref: "#/components/responses/ServiceUnavailable" }
 
+  /resources/{address}/usage:
+    parameters:
+      - name: address
+        in: path
+        required: true
+        schema: { $ref: "#/components/schemas/TronAddress" }
+      - name: days
+        in: query
+        required: false
+        schema: { type: string, enum: ["7", "30"], default: "7" }
+    get:
+      tags: [Chain]
+      operationId: getAddressUsage
+      summary: Energy and bandwidth an address used and burned
+      description: |
+        The transactions this address sent (and paid for) over the last 7 or 30 UTC days, today included: how
+        much energy they used, how much TRX they burned for energy and for bandwidth, and the same per day. It
+        answers "how much energy do I need, and what does burning cost me now" from the address's own history.
+
+        Read from TronGrid's indexed API and cached for 5 minutes per address and period. At most 2,000
+        transactions are read; `capped: true` means there were more and the totals are a lower bound.
+
+        **Public.** No credentials are needed; calls are limited per source IP, and fresh reads are also limited
+        per server, so a burst can answer `429` with `retry_after`.
+      security:
+        - {}
+        - ApiKeyAuth: []
+          ApiTimestamp: []
+          ApiSign: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AddressUsage" }
+              examples:
+                default:
+                  value:
+                    address: TQn9Y2khEsLJW1ChVWFMSMeRDow5KcbLSE
+                    days: 7
+                    transactions: 2
+                    usdt_transfers: 2
+                    out_of_energy: 0
+                    energy_used: 130285
+                    energy_burned_sun: 6514200
+                    bandwidth_burned_sun: 345000
+                    capped: false
+                    per_day:
+                      - { date: "2026-10-08", transactions: 2, energy_used: 130285, energy_burned_sun: 6514200, bandwidth_burned_sun: 345000 }
+                    as_of: "2026-10-09T10:00:00.000Z"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/InternalError" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+
   /status:
     get:
       tags: [Chain]
@@ -3057,6 +4517,13 @@ paths:
         `keys.create` cannot be used to escalate beyond what the caller already has. A key
         created with the bootstrap token may carry any key-eligible scope, because the signing
         address is the account's owner.
+
+        **Keys created by an AI agent** (OAuth access token with `api_keys.manage`): a key that can
+        spend (`orders.create`, `subscriptions.write`) gets the connected agent's own daily and monthly
+        limits when `daily_limit_trx` / `monthly_limit_trx` are omitted. A limit above the agent's, or
+        `null` while the agent has one, is refused with 403 `3032 agent_key_limit_exceeded`
+        (`details.grant_daily_limit_sun`, `details.grant_monthly_limit_sun`). Only the account owner
+        sets other limits, in the dashboard. Such a key shows `created_by_agent`.
       security:
         - ApiKeyAuth: []
           ApiTimestamp: []
@@ -3080,6 +4547,8 @@ paths:
                   label: "payouts worker"
                   scopes: ["prices.read", "orders.read", "orders.create"]
                   ip_allowlist: ["203.0.113.20", "203.0.113.21"]
+      parameters:
+        - { $ref: "#/components/parameters/StepUp" }
       responses:
         "201":
           description: Created. `secret` appears only here.
@@ -3138,6 +4607,10 @@ paths:
         Change `label`, `ip_allowlist`, `is_active`, or `scopes`. Narrowing `scopes` takes effect
         immediately. Widening them is subject to the same rule as creation: the calling key must
         already hold every scope being granted.
+
+        An AI agent may only lower a key's spend limits or set them within its own limits; it cannot
+        remove one while it has a limit itself, nor add a spending scope to a key whose limits exceed
+        its own. Otherwise 403 `3032 agent_key_limit_exceeded`.
       requestBody:
         required: true
         content:
@@ -3219,6 +4692,19 @@ components:
         account, and accepted by exactly four operations: `createAccount`,
         `getSignupDepositAddress`, `getAccount` and `createApiKey`. It is not an API key and
         cannot order, spend or read anything else.
+    AgentAccessToken:
+      type: http
+      scheme: bearer
+      bearerFormat: oat
+      description: |
+        An AI agent's OAuth 2.1 access token from `POST /oauth/token`, sent as `Authorization: Bearer oat_…`
+        (one hour; refresh with the `ort_…` token). Accepted by every operation that accepts an API key and names a
+        scope, except `createBatch` and the platform-admin operations. What it may do is the connected agent's granted
+        scopes (`api_keys.manage` opens `keys.read keys.create keys.revoke`, `webhooks.manage` opens `webhooks.read
+        webhooks.write`, every other scope its own name) AND the current member role of the person who connected it.
+        A bad, expired or revoked token answers 401 `1024 oauth_token_invalid` with `WWW-Authenticate: Bearer
+        error="invalid_token"`; a missing scope 403 `1005 insufficient_scope` with `WWW-Authenticate: Bearer
+        error="insufficient_scope", scope="…"`; an order over the agent's limit 403 `3031 spend_limit_reached`.
 
   headers:
     XRequestId:
@@ -3229,6 +4715,29 @@ components:
       schema: { type: integer, examples: [1] }
 
   parameters:
+    OidcReturnTo:
+      name: return_to
+      in: query
+      description: >-
+        A path on our site to come back to: the cabinet (`/app…` or `/xx/app…`, Nile `/app/nile…`
+        included), or a Nile consent / claim page (`/oauth/consent?…` or `/agent/claim?…`, optional
+        `/xx` prefix) whose query carries exactly one `network=nile`. Nothing with `//`, a backslash, a
+        fragment or other characters; anything else falls back to the cabinet.
+      schema: { type: string }
+    OidcFirstTouch:
+      name: first_touch
+      in: query
+      description: How the visitor first found the site (JSON, at most 2000 characters); stored once on a new account.
+      schema: { type: string }
+    StepUp:
+      name: X-Step-Up
+      in: header
+      required: false
+      description: |
+        A 2-step approval: `details.step_up_id` of a `1020 step_up_required` answer, approved with
+        `POST /v1/step-up/{id}/approve`. Sent on the repeat of the identical request; used once.
+        Only a dashboard session whose person switched 2-step on is ever asked for it.
+      schema: { type: string }
     IdempotencyKey:
       name: Idempotency-Key
       in: header
@@ -3362,6 +4871,12 @@ components:
           schema: { $ref: "#/components/schemas/Error" }
 
   schemas:
+    JustLendCallCost:
+      type: object
+      required: [energy, bandwidth]
+      properties:
+        energy: { type: integer, description: Energy of the whole call, owner and caller together. }
+        bandwidth: { type: integer, description: Bandwidth bytes the caller pays. }
     MarketPriceStats:
       description: SUN per energy unit over the month's ok readings with a price; null when there are none.
       type: [object, "null"]
@@ -3390,6 +4905,34 @@ components:
 
     # ---- primitives
 
+    WalletPaymentRequest:
+      type: object
+      additionalProperties: false
+      required: [payer, receiver, amount_sun]
+      properties:
+        payer: { $ref: "#/components/schemas/TronAddress" }
+        receiver: { $ref: "#/components/schemas/TronAddress" }
+        tier: { type: string, enum: ["5m", "15m", "1h", "1d", "3d", "30d"], default: "1h" }
+        amount_sun:
+          type: integer
+          minimum: 1
+          maximum: 100000000000
+          description: What the payer sends, in SUN; the energy is priced at the block like any transfer to this address.
+    WalletPayment:
+      type: object
+      required: [txid, transaction, payment_address, payer, receiver, tier, amount_sun, expires_at]
+      properties:
+        txid: { type: string, description: The hash the receiver is bound to; also the transfer's on-chain id. }
+        transaction:
+          type: object
+          description: The unsigned transaction (txID, raw_data, raw_data_hex) to sign and broadcast unchanged.
+          additionalProperties: true
+        payment_address: { $ref: "#/components/schemas/TronAddress" }
+        payer: { $ref: "#/components/schemas/TronAddress" }
+        receiver: { $ref: "#/components/schemas/TronAddress" }
+        tier: { type: string }
+        amount_sun: { type: integer }
+        expires_at: { type: string, format: date-time, description: The network refuses the bytes after this. }
     TronAddress:
       type: string
       description: Base58Check TRON address (starts with `T`, 34 characters).
@@ -3452,6 +4995,10 @@ components:
         Terminal states: `expired`, `reclaimed`, `failed`, `refunded`. Everything else can still
         change.
 
+        **No lock.** Energy is delegated for the rental window by the supplier that fills the
+        order. Delegations are not locked on chain, and suppliers hold them on their own terms, so
+        TEnergy does not guarantee that a delegation stays for the full window.
+
         **There are no other order states.** Partial delivery is not a state — it is the
         `partial` flag plus `delivered_amount` on the order, and such an order is `confirmed`
         then `active` like any other. Anything that looks like a sub-state is a field.
@@ -3468,8 +5015,8 @@ components:
 
     SourceType:
       type: string
-      enum: [api, dashboard, transfer, bot, subscription, batch, proxy]
-      description: Where the order came from. `transfer` is a direct-transfer purchase with no account.
+      enum: [api, dashboard, transfer, bot, subscription, batch, proxy, x402, promo]
+      description: Where the order came from. `transfer` is a direct-transfer purchase with no account; `x402` is a purchase paid with USDC on Base through x402, also with no account; `promo` is the free grant of the promo token redeem, no payment and no account.
 
     SubscriptionStatus:
       type: string
@@ -3477,6 +5024,53 @@ components:
       description: |
         `paused` is set by you; `suspended` is set by the platform when the balance cannot cover the
         next refill and clears itself after a deposit; `cancelled` is terminal.
+
+    RefillRequest:
+      type: object
+      required: [receiver]
+      properties:
+        client_order_id: { type: string, maxLength: 64, pattern: "^[A-Za-z0-9._:-]+$" }
+        receiver: { type: string, description: The address whose used resource is restored. }
+        resource: { type: string, enum: [energy, bandwidth], default: energy }
+        amount: { type: integer, minimum: 1, description: Units to restore. Required (or its alias `energy`). }
+        energy: { type: integer, minimum: 1, description: Alias of `amount`. }
+        max_price_sun: { type: integer, minimum: 0, description: Refuse with `3006` if the total is higher. }
+        group_id: { type: string, maxLength: 64 }
+        label: { type: string, maxLength: 64 }
+
+    Refill:
+      type: object
+      required: [id, object, status, resource, receiver, requested_amount, total_sun, refunded_sun, fee_bps, created_at]
+      properties:
+        id: { type: string }
+        object: { type: string, const: refill }
+        client_order_id: { type: [string, "null"] }
+        status: { type: string, enum: [created, paid, submitted, completed, failed] }
+        resource: { type: string, enum: [energy, bandwidth] }
+        receiver: { type: string }
+        requested_amount: { type: integer }
+        restored_amount: { type: [integer, "null"], description: Units the venue restored; set when completed. }
+        price_sun_per_unit: { type: [number, "null"], description: "Charged SUN per requested unit (venue price + fee)." }
+        fee_bps: { type: integer }
+        fee_source: { type: string, enum: [tier, promo] }
+        total_sun: { type: integer, description: Charged when created. }
+        captured_sun: { type: [integer, "null"], description: "Kept at settlement: restored x unit price, rounded down." }
+        refunded_sun: { type: integer }
+        delegate_txid: { type: [string, "null"] }
+        reclaim_txid: { type: [string, "null"] }
+        error_code: { type: [string, "null"] }
+        label: { type: [string, "null"] }
+        group_id: { type: [string, "null"] }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        completed_at: { type: [string, "null"], format: date-time }
+
+    RefillList:
+      type: object
+      required: [data, next_cursor]
+      properties:
+        data: { type: array, items: { $ref: "#/components/schemas/Refill" } }
+        next_cursor: { type: [string, "null"] }
 
     WebhookEventType:
       type: string
@@ -3494,6 +5088,9 @@ components:
         - balance.credited
         - balance.low
         - deposit_address.rotated
+        - refill.completed
+        - refill.failed
+        - refill.refunded
       description: |
         Full catalogue with payloads in `webhooks.md`. `balance.credited` for a deposit also
         carries `asset` (`TRX`|`USDT`), `usdt_amount`, `rate` (SUN per USDT after spread),
@@ -3522,6 +5119,11 @@ components:
               properties: { status: { $ref: "#/components/schemas/StatusLevel" } }
             database:
               type: object
+              required: [status]
+              properties: { status: { $ref: "#/components/schemas/StatusLevel" } }
+            redis:
+              type: object
+              description: The cache that carries rate limits, idempotency and quote holds; `down` when it does not answer within 2 s (then requests fail too).
               required: [status]
               properties: { status: { $ref: "#/components/schemas/StatusLevel" } }
             payments:
@@ -3611,7 +5213,7 @@ components:
       properties:
         nonce: { type: string, description: Single-use, 32 hex characters. }
         address: { $ref: "#/components/schemas/TronAddress" }
-        purpose: { type: string, enum: [signup, login, recovery] }
+        purpose: { type: string, enum: [signup, login, recovery, link, promo_redeem, promo_dev_code] }
         message:
           type: string
           description: |
@@ -3623,6 +5225,89 @@ components:
           type: string
           format: date-time
           description: Ten minutes after issue. An expired nonce gives `1010 challenge_invalid`.
+
+    Promo:
+      type: object
+      required: [network, state, starts_at, ends_at, cap_per_day, left_today, resets_at, grant, token, forward_address]
+      properties:
+        network: { type: string, enum: [mainnet, nile] }
+        state:
+          type: string
+          enum: [active, cap_reached_today, not_started, ended, "off"]
+          description: "`off`: no promo on this network; every field below is then null."
+        starts_at: { type: [string, "null"], format: date-time }
+        ends_at: { type: [string, "null"], format: date-time }
+        cap_per_day: { type: [integer, "null"], description: Grants per UTC day. }
+        left_today: { type: [integer, "null"] }
+        resets_at: { type: [string, "null"], format: date-time, description: The next UTC midnight. }
+        grant:
+          type: [object, "null"]
+          required: [resource, amount, duration_seconds]
+          properties:
+            resource: { type: string, enum: [energy] }
+            amount: { type: integer, example: 65000 }
+            duration_seconds: { type: integer, example: 3600 }
+        token:
+          type: [object, "null"]
+          required: [id, name]
+          properties:
+            id: { type: string, description: The TRC10 token id. }
+            name: { type: string, example: tenergy.app }
+        forward_address:
+          oneOf:
+            - $ref: "#/components/schemas/TronAddress"
+            - type: "null"
+          description: Forward any amount of the token here instead of signing (the page asks for exactly 1).
+
+    PromoDevCode:
+      type: object
+      required: [code, fee_pct, duration_days, activate_by, used]
+      properties:
+        code: { type: string, example: DEV-K7M2Q9XA }
+        fee_pct: { type: number, example: 3 }
+        duration_days: { type: integer, example: 30, description: Counted from when an account enters the code. }
+        activate_by: { type: [string, "null"], format: date-time, description: The last moment the code can be entered. }
+        used: { type: boolean, description: An account has entered it already (single use). }
+
+    WalletTicketRequest:
+      type: object
+      required: [ticket]
+      properties:
+        ticket: { type: string, description: "`wallet_ticket.token` from `POST /promo/redeem`." }
+
+    PromoRedeemResult:
+      allOf:
+        - $ref: "#/components/schemas/PromoRedemption"
+        - type: object
+          required: [has_account, wallet_ticket]
+          properties:
+            has_account:
+              type: boolean
+              description: The wallet already opens an account (its own, or one it is linked to). The page offers "go to the dashboard"; otherwise "create an account with this wallet" or "sign in another way".
+            wallet_ticket:
+              type: object
+              required: [token, expires_at]
+              description: |
+                The signature just checked, usable ONCE within ten minutes: `POST /session/wallet-ticket` signs in with
+                this wallet; after signing in another way, `POST /session/identities/wallet/ticket` links it. Keep it in
+                memory only; never in a URL or storage.
+              properties:
+                token: { type: string }
+                expires_at: { type: string, format: date-time }
+
+    PromoRedemption:
+      type: object
+      required: [address, method, redeemed_at, status, energy, expires_at]
+      properties:
+        address: { $ref: "#/components/schemas/TronAddress" }
+        method: { type: string, enum: [signature, forward] }
+        redeemed_at: { type: string, format: date-time }
+        status:
+          type: string
+          enum: [granting, delegated, failed]
+          description: "`failed`: no energy could be delegated; an operator sees it. A grant is never made twice."
+        energy: { type: integer, example: 65000 }
+        expires_at: { type: [string, "null"], format: date-time, description: When the delegation ends, once delegated. }
 
     AccountChallengeVerifyRequest:
       type: object
@@ -3802,8 +5487,10 @@ components:
           oneOf: [{ $ref: "#/components/schemas/TronAddress" }, { type: "null" }]
           description: The wallet that owns this account; signing in with it is how it is recovered.
         address:
-          allOf: [{ $ref: "#/components/schemas/TronAddress" }]
-          description: The address that signed in. The owner's, unless a member was invited.
+          oneOf: [{ $ref: "#/components/schemas/TronAddress" }, { type: "null" }]
+          description: |
+            The address that signed in. The owner's, unless a member was invited. `null` for a
+            session signed in without a wallet (e-mail code).
         role:
           type: [string, "null"]
           enum: [owner, editor, viewer, null]
@@ -3888,14 +5575,18 @@ components:
           type: array
           items:
             type: object
-            required: [slug, name, rank, price_sun_1h, price_sun_1d, savings_pct, available_energy, total_energy, kinds, links, ts, stale]
+            required: [slug, name, rank, price_sun_1h, price_sun_1d, bandwidth_sun_1h, bandwidth_sun_1d, savings_pct, available_energy, total_energy, kinds, links, ts, stale, routed, routed_bandwidth]
             properties:
               slug: { type: string, examples: [provider-slug] }
               name: { type: string }
-              rank: { type: [integer, "null"], description: 1 = cheapest 1h price; null when unpriced. }
+              rank: { type: [integer, "null"], description: "1 = cheapest 1h price; an equal price shares the place (1, 2, 2, 3); null when unpriced." }
               price_sun_1h: { type: [number, "null"] }
               price_sun_1d: { type: [number, "null"] }
+              bandwidth_sun_1h: { type: [number, "null"], description: SUN per bandwidth unit for 1 hour where the provider publishes one; null otherwise. }
+              bandwidth_sun_1d: { type: [number, "null"], description: SUN per bandwidth unit for 1 day where the provider publishes one; null otherwise. }
               savings_pct: { type: [number, "null"], description: "(1 − price_sun_1h / burn_sun) × 100, two decimals." }
+              routed: { type: boolean, description: "True when the TEnergy router can buy from this provider right now (a fresh 1-hour energy offer in its supply book). Always false on the TEnergy row." }
+              routed_bandwidth: { type: boolean, description: "The same for bandwidth: a fresh bandwidth offer in a term on sale. Always false on the TEnergy row." }
               available_energy: { type: [integer, "null"] }
               total_energy: { type: [integer, "null"] }
               kinds: { type: array, items: { type: string, enum: [api, bot, pool, market, web] } }
@@ -3922,6 +5613,24 @@ components:
       required: [network, as_of, valid_until, items, subscriptions_available]
       properties:
         network: { type: string, enum: [mainnet, nile] }
+        refills:
+          type: object
+          required: [available, items]
+          description: |
+            Refills (`POST /v1/refills`): whether one can be bought now, and per resource the accepted size
+            range and the cheapest enabled venue's indicative unit price (SUN, before your routing fee).
+          properties:
+            available: { type: boolean }
+            items:
+              type: array
+              items:
+                type: object
+                required: [resource, min_amount, max_amount, price_sun]
+                properties:
+                  resource: { type: string, enum: [energy, bandwidth] }
+                  min_amount: { type: integer }
+                  max_amount: { type: integer }
+                  price_sun: { type: [number, "null"] }
         subscriptions_available:
           type: boolean
           description: |
@@ -4024,7 +5733,10 @@ components:
                   switched off: the price is shown, an order for it is `2003 tier_unavailable`.
               price_sun_per_unit:
                 type: integer
-                description: SUN per one unit of the resource for the whole tier period.
+                description: |
+                  SUN per one unit of the resource for the whole tier period, before the routing
+                  fee (`GET /v1/fees`); an estimate, quote or order adds it. Rounded to whole SUN;
+                  `price_steps[]` and `schedule[]` carry the 0.01 SUN step.
               min_amount: { type: integer }
               max_amount: { type: integer }
               volume_tiers:
@@ -4039,7 +5751,8 @@ components:
               price_steps:
                 type: array
                 description: |
-                  Price by order size, cheapest first. An amount is sold at the cheapest step whose
+                  Price by order size, cheapest first, before the routing fee. Each step is one
+                  supply offer, so ranges can overlap; an amount is sold at the cheapest step whose
                   range covers it; a direct transfer buys the largest amount any one step sells for
                   the payment. Present on the energy rows priced from live supply.
                 items:
@@ -4144,7 +5857,14 @@ components:
         amount: { type: integer }
         tier: { $ref: "#/components/schemas/Tier" }
         receiver: { oneOf: [{ $ref: "#/components/schemas/TronAddress" }, { type: "null" }] }
-        price_sun_per_unit: { type: integer }
+        price_sun_per_unit:
+          type: integer
+          description: Rounded to whole SUN; `unit_price_sun` is the exact value.
+        unit_price_sun:
+          type: number
+          description: |
+            The exact price behind `energy_amount_sun`, SUN per unit, to the 0.01 SUN step, as on
+            a quote. `price_sun_per_unit × amount` can differ from `energy_amount_sun`; this cannot.
         energy_amount_sun:
           allOf: [{ $ref: "#/components/schemas/Sun" }]
           description: Cost of the resource itself, before activation.
@@ -4152,10 +5872,62 @@ components:
           allOf: [{ $ref: "#/components/schemas/Sun" }]
           description: "`0` when the receiver is already active or was not supplied."
         total_amount_sun: { $ref: "#/components/schemas/Sun" }
+        provider_amount_sun:
+          type: [integer, "null"]
+          description: |
+            The provider price inside `total_amount_sun`, before the service fee. `null` on lines priced
+            without a fee (orders before 2026-10-06, bandwidth, activation, contract prices).
+        fee:
+          oneOf: [{ $ref: "#/components/schemas/ServiceFee" }, { type: "null" }]
         receiver_activated:
           type: [boolean, "null"]
           description: "`null` when `receiver` was not supplied."
         as_of: { type: string, format: date-time }
+
+    ServiceFee:
+      type: object
+      description: |
+        The service fee inside a price (routing-fee-tiers-spec.md): a percentage of the provider price, by the
+        account's spend over the last 30 days, or a promo code's rate when that is lower.
+      required: [bps, amount_sun, source]
+      properties:
+        bps: { type: integer, description: "Basis points of the provider price: 500 = 5 %." }
+        amount_sun: { $ref: "#/components/schemas/Sun" }
+        source: { type: string, enum: [tier, promo] }
+
+    FeeTier:
+      type: object
+      required: [from_sun, fee_bps]
+      properties:
+        from_sun:
+          type: integer
+          description: The tier starts at this 30-day spend, SUN, fee included.
+        fee_bps: { type: integer }
+
+    AccountFee:
+      type: object
+      required: [fee_bps, source, tier_bps, spend_30d_sun, next_tier, promo, tiers]
+      properties:
+        fee_bps: { type: integer, description: The rate the next order is charged. }
+        source: { type: string, enum: [tier, promo] }
+        tier_bps: { type: integer, description: The rate by volume alone. }
+        spend_30d_sun:
+          allOf: [{ $ref: "#/components/schemas/Sun" }]
+          description: Paid over the last 30 days, rolling, net of refunds, fee included.
+        next_tier:
+          oneOf: [{ $ref: "#/components/schemas/FeeTier" }, { type: "null" }]
+        promo:
+          oneOf:
+            - type: object
+              required: [code, fee_bps, expires_at]
+              properties:
+                code: { type: string }
+                fee_bps: { type: integer }
+                expires_at: { type: string, format: date-time }
+            - type: "null"
+        tiers:
+          type: array
+          items: { $ref: "#/components/schemas/FeeTier" }
 
     QuoteRequest:
       type: object
@@ -4193,6 +5965,13 @@ components:
         energy_amount_sun: { $ref: "#/components/schemas/Sun" }
         activate_amount_sun: { $ref: "#/components/schemas/Sun" }
         total_amount_sun: { $ref: "#/components/schemas/Sun" }
+        provider_amount_sun:
+          type: [integer, "null"]
+          description: |
+            The provider price inside `total_amount_sun`, before the service fee. `null` on lines priced
+            without a fee (orders before 2026-10-06, bandwidth, activation, contract prices).
+        fee:
+          oneOf: [{ $ref: "#/components/schemas/ServiceFee" }, { type: "null" }]
         created_at: { type: string, format: date-time }
         expires_at:
           type: string
@@ -4299,8 +6078,10 @@ components:
         delivered_amount:
           type: [integer, "null"]
           description: |
-            What was actually delegated. Equal to `amount` on a normal order; below it when
-            `partial` is true. `null` until delivery. Mirrors `BatchItem.delivered_amount`.
+            What was actually delegated. Equal to `amount` or slightly above it on a normal order
+            (a delegation from stake is rounded up by a small margin so the receiver never gets
+            less); below it when `partial` is true. `null` until delivery. Mirrors
+            `BatchItem.delivered_amount`.
         partial:
           type: boolean
           default: false
@@ -4329,6 +6110,13 @@ components:
         total_amount_sun:
           allOf: [{ $ref: "#/components/schemas/Sun" }]
           description: "`pay_amount_sun + activate_amount_sun`. What left the balance."
+        provider_amount_sun:
+          type: [integer, "null"]
+          description: |
+            The provider price inside `total_amount_sun`, before the service fee. `null` on lines priced
+            without a fee (orders before 2026-10-06, bandwidth, activation, contract prices).
+        fee:
+          oneOf: [{ $ref: "#/components/schemas/ServiceFee" }, { type: "null" }]
         refunded_amount_sun:
           allOf: [{ $ref: "#/components/schemas/Sun" }]
           description: Credited back so far. Non-zero for `failed` and `refunded` orders.
@@ -4704,6 +6492,17 @@ components:
           type: string
           enum: [primary, backup]
           description: Omit to take the first free role.
+        format:
+          type: string
+          enum: [native, netts, catfee]
+          description: |
+            `native` (default): our envelope, signed `X-API-SIGN`. `netts`: Netts' own events
+            (`delegation.confirmed`, `bandwidth.delegated`), body and `X-Netts-*` headers, signed
+            `sha256=<hex>` with this endpoint's secret, for a handler written for Netts. Events Netts
+            does not have (failures, expiry, balance) are not sent to a `netts` endpoint. `catfee`:
+            CatFee's `{event_type, event_id, data}` envelope (`EVENT_DELEGATION`), `X-EVENT-*` headers
+            and the v1 signature; the secret is then 32 bytes in standard Base64, as CatFee issues it.
+            A format cannot be changed to or from `catfee` (the secret forms differ).
         events:
           type: array
           description: |
@@ -4723,6 +6522,7 @@ components:
           type: [array, "null"]
           description: "`null` means all events."
           items: { $ref: "#/components/schemas/WebhookEventType" }
+        format: { type: string, enum: [native, netts, catfee] }
         is_active: { type: boolean }
         last_delivery_at: { type: [string, "null"], format: date-time }
         last_delivery_status: { type: [integer, "null"] }
@@ -4739,9 +6539,51 @@ components:
           type: [array, "null"]
           items: { $ref: "#/components/schemas/WebhookEventType" }
         is_active: { type: boolean }
+        format: { type: string, enum: [native, netts, catfee] }
 
     # ---- chain
 
+    AddressUsage:
+      type: object
+      additionalProperties: false
+      required: [address, days, transactions, usdt_transfers, out_of_energy, energy_used, energy_burned_sun, bandwidth_burned_sun, capped, per_day, as_of]
+      properties:
+        address: { $ref: "#/components/schemas/TronAddress" }
+        days: { type: integer, enum: [7, 30] }
+        transactions: { type: integer, minimum: 0, description: Transactions the address sent in the period. }
+        usdt_transfers: { type: integer, minimum: 0, description: Of those, calls to the network's USDT contract. }
+        usdt_to_new:
+          type: integer
+          minimum: 0
+          description: |
+            Completed USDT transfers that went to an address holding no USDT. Classified by the energy the
+            chain charged for the transfer (at least 100,000, the ~131k case); no balance is read per receiver.
+        usdt_to_existing:
+          type: integer
+          minimum: 0
+          description: Completed USDT transfers that went to an address already holding USDT (below 100,000 energy, the ~65k case).
+        out_of_energy: { type: integer, minimum: 0, description: Of those, failed with OUT_OF_ENERGY. }
+        energy_used: { type: integer, minimum: 0, description: "Energy consumed in total: own stake, delegated (rented) and burned." }
+        energy_burned_sun: { type: integer, minimum: 0, description: SUN burned because energy was missing. }
+        bandwidth_burned_sun: { type: integer, minimum: 0, description: SUN burned because bandwidth was missing. }
+        capped: { type: boolean, description: More than 2,000 transactions; the totals are a lower bound. }
+        per_day:
+          type: array
+          description: One entry per UTC day, oldest first; the last one is today so far.
+          items:
+            type: object
+            additionalProperties: false
+            required: [date, transactions, energy_used, energy_burned_sun, bandwidth_burned_sun]
+            properties:
+              date: { type: string, format: date }
+              transactions: { type: integer, minimum: 0 }
+              energy_used: { type: integer, minimum: 0 }
+              energy_burned_sun: { type: integer, minimum: 0 }
+              bandwidth_burned_sun: { type: integer, minimum: 0 }
+              usdt_transfers: { type: integer, minimum: 0, description: Calls to the network's USDT contract that day. }
+              usdt_to_new: { type: integer, minimum: 0, description: That day's completed USDT transfers to a new holder. }
+              usdt_to_existing: { type: integer, minimum: 0, description: That day's completed USDT transfers to an existing holder. }
+        as_of: { type: string, format: date-time }
     AddressResources:
       type: object
       required: [address, activated, energy, bandwidth, as_of]
@@ -4970,7 +6812,250 @@ components:
       properties:
         signed_in_at: { type: string, format: date-time }
         ip: { type: [string, "null"] }
-        address: { $ref: "#/components/schemas/TronAddress" }
+        address:
+          oneOf: [{ $ref: "#/components/schemas/TronAddress" }, { type: "null" }]
+          description: The wallet that signed in; `null` for a sign-in without a wallet (e-mail code).
+        method:
+          type: [string, "null"]
+          description: |
+            How the person signed in: the kind of the identity used (`wallet`, `email`, `telegram`, `google`; more
+            may follow, so show an unknown value generically). `null` when it is not known.
+
+    SignInMethods:
+      type: object
+      required: [wallet_login, email_login, telegram_login, google_login]
+      properties:
+        wallet_login: { type: boolean }
+        email_login: { type: boolean }
+        telegram_login: { type: boolean }
+        google_login: { type: boolean }
+        sign_in_on:
+          type: string
+          enum: [mainnet]
+          description: "Nile only: people sign in on the mainnet API and arrive here by pass."
+
+    OidcLinkRequest:
+      type: object
+      properties:
+        return_to:
+          type: string
+          description: >-
+            Cabinet path to come back to (`/app…` or `/xx/app…`, Nile `/app/nile…` included); default the
+            profile.
+
+    OidcLinkStarted:
+      type: object
+      required: [url]
+      properties:
+        url: { type: string, format: uri, description: The provider's authorization URL to open. }
+
+    Identity:
+      type: object
+      required: [id, kind, display, verified_at, last_used_at, created_at, current]
+      properties:
+        id: { type: string, examples: ["idn_01J9Z4K2M7Q8"] }
+        kind: { type: string, enum: [wallet, email, telegram, google] }
+        display:
+          type: [string, "null"]
+          description: What to show - the address, or the e-mail as it was typed.
+        verified_at: { type: [string, "null"], format: date-time }
+        last_used_at: { type: [string, "null"], format: date-time }
+        created_at: { type: string, format: date-time }
+        current: { type: boolean, description: The identity this session signed in with. }
+        moved_from_empty_account:
+          type: object
+          description: |
+            Only in a link answer, when the method was taken over from another, empty account (spec §1.4).
+          required: [account_closed]
+          properties:
+            account_closed: { type: boolean, description: That account had no way in left and is now closed. }
+
+    StepUpEmail:
+      type: object
+      required: [identity_id, address, source]
+      properties:
+        identity_id: { type: string, description: The sign-in method the address comes from. }
+        address: { type: string, description: "The whole address: it is the signed-in person's own." }
+        source:
+          type: string
+          enum: [email, google]
+          description: |
+            `email`: a verified e-mail sign-in method; `google`: the address a linked Google account reports as
+            verified. A Google address only receives codes; it never signs in.
+
+    StepUpState:
+      type: object
+      required: [channel, available, email, emails, telegram, google_email_unknown]
+      properties:
+        channel: { type: string, enum: ["off", email, telegram, wallet] }
+        available:
+          type: array
+          description: Channels this person can switch to now.
+          items: { type: string, enum: [email, telegram, wallet] }
+        email:
+          description: |
+            Where e-mail codes go: the person's choice while it is usable, else the first usable address (an
+            e-mail method before a Google address). Null when there is none.
+          oneOf:
+            - $ref: "#/components/schemas/StepUpEmail"
+            - type: "null"
+        emails:
+          type: array
+          description: Every address that can receive codes, in fallback order.
+          items: { $ref: "#/components/schemas/StepUpEmail" }
+        telegram:
+          description: The Telegram account the bot sends codes to; null without one or without the bot.
+          oneOf:
+            - type: object
+              required: [identity_id, display]
+              properties:
+                identity_id: { type: string }
+                display: { type: ["string", "null"], description: "The account's @username or name, when Telegram gave one." }
+            - type: "null"
+        google_email_unknown:
+          type: boolean
+          description: |
+            Always false; kept for older clients. A Google account linked before its address was recorded offers
+            the address it was linked with.
+
+    OAuthScope:
+      type: string
+      description: |
+        A permission an agent may be granted. The first seven are the API key scopes of the same
+        name; `api_keys.manage` (list, create, revoke API keys) and `webhooks.manage` (read and
+        change webhook endpoints) are opt-in. Withdrawals, members and sign-in methods are never
+        grantable.
+      enum: [prices.read, balance.read, balance.topup_address, orders.read, orders.create, orders.reclaim, subscriptions.read, api_keys.manage, webhooks.manage]
+
+    OAuthRequest:
+      type: object
+      required: [id, expires_at, client, redirect_uri, resource, scopes, defaults, step_up]
+      properties:
+        id: { type: string }
+        expires_at: { type: string, format: date-time }
+        client:
+          type: object
+          required: [client_id, name, host, source, client_uri, logo_uri]
+          properties:
+            client_id: { type: string, description: "A registered id, or the URL of the client's metadata document." }
+            name: { type: string }
+            host: { type: string, description: "The client's site. Empty for a self-registered agent (`client_id` `reg_…`): no site was verified." }
+            source: { type: string, enum: [dcr, cimd] }
+            client_uri: { type: [string, "null"] }
+            logo_uri: { type: [string, "null"] }
+        redirect_uri: { type: string }
+        resource: { type: string, description: "The API or MCP URL the token will be for." }
+        scopes:
+          type: array
+          items:
+            type: object
+            required: [scope, opt_in, checked]
+            properties:
+              scope: { $ref: "#/components/schemas/OAuthScope" }
+              opt_in: { type: boolean }
+              checked: { type: boolean, description: Pre-checked on the consent page. }
+        defaults:
+          type: object
+          required: [spend_limit_day_sun, spend_limit_month_sun, expires_in_days]
+          properties:
+            spend_limit_day_sun: { type: integer }
+            spend_limit_month_sun: { type: integer }
+            expires_in_days: { type: [integer, "null"], description: "`null` = no expiry (the default)." }
+        step_up: { type: string, enum: ["off", email, telegram, wallet], description: "The person's 2-step channel." }
+
+    OAuthDecisionRequest:
+      type: object
+      required: [approve]
+      properties:
+        approve: { type: boolean }
+        scopes:
+          type: array
+          description: Required when approving; a subset of the requested scopes.
+          items: { $ref: "#/components/schemas/OAuthScope" }
+        spend_limit_day_sun: { type: [integer, "null"], minimum: 1 }
+        spend_limit_month_sun: { type: [integer, "null"], minimum: 1 }
+        expires_in_days: { type: [integer, "null"], minimum: 1, maximum: 365 }
+
+    OAuthGrantPatch:
+      type: object
+      properties:
+        spend_limit_day_sun: { type: integer, minimum: 1 }
+        spend_limit_month_sun: { type: integer, minimum: 1 }
+        expires_in_days: { type: [integer, "null"], minimum: 1, maximum: 365, description: "From now; `null` = no expiry." }
+
+    OAuthGrant:
+      type: object
+      required: [id, client_id, client_name, client_host, resource, scopes, spend_limit_day_sun, spend_limit_month_sun, spent_day_sun, spent_month_sun, expires_at, created_at, last_used_at, last_ip, user_id]
+      properties:
+        id: { type: string }
+        client_id: { type: string }
+        client_name: { type: string }
+        client_host: { type: string, description: "The client's site. Empty for a self-registered agent (`client_id` `reg_…`): no site was verified." }
+        resource: { type: string }
+        scopes:
+          type: array
+          items: { $ref: "#/components/schemas/OAuthScope" }
+        spend_limit_day_sun: { type: [integer, "null"] }
+        spend_limit_month_sun: { type: [integer, "null"] }
+        spent_day_sun:
+          type: integer
+          description: What the agent's orders cost since 00:00 UTC today (failed orders count nothing, refunds are subtracted).
+        spent_month_sun:
+          type: integer
+          description: The same since the first of this UTC month.
+        expires_at: { type: [string, "null"], format: date-time }
+        created_at: { type: string, format: date-time }
+        last_used_at:
+          type: [string, "null"]
+          format: date-time
+          description: Last token issue or API call by the agent (API calls recorded at most once a minute).
+        last_ip: { type: [string, "null"] }
+        user_id: { type: string, description: The member who connected the agent. }
+
+    StepUpApproveRequest:
+      type: object
+      properties:
+        code: { type: string, pattern: "^[0-9]{6}$", description: E-mail channel. }
+        signature: { type: string, description: "Wallet channel: TIP-191 signature over `details.message`." }
+        pass:
+          type: string
+          description: >-
+            Nile, a session opened by a mainnet pass (`1020` with `details.via: mainnet`): the step-up pass
+            from mainnet `POST /session/step-up/nile` for this request; codes and signatures do not apply.
+
+    StepUpApproved:
+      type: object
+      required: [id, status, expires_at]
+      properties:
+        id: { type: string }
+        status: { type: string, enum: [approved] }
+        expires_at: { type: string, format: date-time }
+
+    EmailCodeStartRequest:
+      type: object
+      required: [email]
+      properties:
+        email: { type: string, format: email, maxLength: 254 }
+        locale:
+          type: string
+          description: "`ru...` sends the Russian mail; anything else English."
+
+    EmailCodeStarted:
+      type: object
+      required: [expires_in, resend_after]
+      properties:
+        expires_in: { type: integer, description: Seconds a code lives (600). }
+        resend_after: { type: integer, description: Seconds before another code may be requested (60). }
+        retry_after:
+          type: integer
+          description: Present when no code was sent because one was sent too recently; wait this long.
+
+    EmailCodeVerifyRequest:
+      type: object
+      required: [email, code]
+      properties:
+        email: { type: string, format: email, maxLength: 254 }
+        code: { type: string, pattern: "^[0-9]{6}$" }
 
     TransferEstimateRequest:
       type: object
@@ -5106,8 +7191,24 @@ components:
             integration written for it moves here by changing the base URL and the key. Plain
             energy rental only (price, order, status, balance, activation); a 1-hour term. Such a
             key may hold only `orders.create`, `orders.read`, `balance.read`,
-            `balance.topup_address`, `prices.read` (and `orders.reclaim` where the service has
-            it). Values: the dialect ids listed in the compatibility docs.
+            `balance.topup_address`, `prices.read`, and `orders.reclaim` for the services with an
+            early return: iTRX, trxx.io, CatFee, Netts, SoHu, Tron Energy Market; a Netts key may also hold
+            `webhooks.read` / `webhooks.write` and then sees and changes only the endpoints it registered. Values: the dialect ids listed in the compatibility docs.
+        daily_limit_trx:
+          type: [number, "null"]
+          exclusiveMinimum: 0
+          maximum: 1000000
+          description: |
+            The most orders placed with this key may cost per UTC day, in TRX. Past it an order is refused with
+            `3026 api_key_spend_limit_reached` until 00:00 UTC. Absent or `null` = no daily limit. Compatible-API
+            calls count too. For a spending key created by an AI agent: absent = the agent's own daily limit, and
+            `null` or more than the agent's limit is refused with `3032 agent_key_limit_exceeded`.
+          examples: [100]
+        monthly_limit_trx:
+          type: [number, "null"]
+          exclusiveMinimum: 0
+          maximum: 10000000
+          description: The same per UTC calendar month. Absent or `null` = no monthly limit (agent keys as above).
 
     NodeKey:
       type: object
@@ -5159,6 +7260,25 @@ components:
         compat_dialect:
           type: [string, "null"]
           description: The compatible-API dialect of this key, `null` for a native key.
+        daily_limit_sun:
+          type: [integer, "null"]
+          format: int64
+          description: The most orders placed with this key may cost per UTC day, in SUN; `null` = no limit.
+        monthly_limit_sun:
+          type: [integer, "null"]
+          format: int64
+          description: The same per UTC calendar month; `null` = no limit.
+        created_by_agent:
+          type: [object, "null"]
+          description: |
+            The AI agent (connected-agent grant) that created this key; `null` for a key a person or another key
+            created. Its spend limits stay within that agent's unless the account owner changes them in the dashboard.
+          required: [grant_id, client_name]
+          properties:
+            grant_id:
+              type: [string, "null"]
+              description: The grant; `null` once that grant was deleted.
+            client_name: { type: string, description: "The agent's name when it created the key." }
         is_active: { type: boolean }
         last_used_at:
           type: [string, "null"]
@@ -5188,3 +7308,13 @@ components:
           items: { type: string }
         is_active: { type: boolean }
         expires_at: { type: [string, "null"], format: date-time }
+        daily_limit_trx:
+          type: [number, "null"]
+          exclusiveMinimum: 0
+          maximum: 1000000
+          description: A new daily spend limit in TRX; `null` removes it.
+        monthly_limit_trx:
+          type: [number, "null"]
+          exclusiveMinimum: 0
+          maximum: 10000000
+          description: A new monthly spend limit in TRX; `null` removes it.

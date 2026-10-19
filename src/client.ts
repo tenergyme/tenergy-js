@@ -123,6 +123,12 @@ export interface TenergyClientOptions {
   sleep?: (ms: number) => Promise<void>;
   /** Extra headers on every request. Never allowed to override the signed auth headers. */
   headers?: Record<string, string>;
+  /**
+   * Sent INSTEAD of the API-key signature on every call that needs or accepts a credential. For a service acting
+   * for someone else, e.g. the hosted MCP server calling for an agent's OAuth grant (`x-service-token` +
+   * `x-grant-id`). Ignored when `apiKey` is set.
+   */
+  authHeaders?: Record<string, string>;
   userAgent?: string;
   /**
    * Called once per HTTP answer (every attempt, success or error) with its status. The typed
@@ -190,6 +196,7 @@ export class TenergyClient {
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly extraHeaders: Record<string, string>;
+  private readonly authHeaders: Record<string, string> | undefined;
   private readonly userAgent: string;
   private readonly onResponse: ((info: ResponseInfo) => void) | undefined;
 
@@ -227,7 +234,8 @@ export class TenergyClient {
     this.now = options.now ?? (() => Date.now());
     this.sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.extraHeaders = options.headers ?? {};
-    this.userAgent = options.userAgent ?? 'tenergy-sdk-ts/0.1.0-beta.0';
+    this.authHeaders = options.apiKey === undefined ? options.authHeaders : undefined;
+    this.userAgent = options.userAgent ?? 'tenergy-sdk-ts/0.1.0-beta.1';
     this.onResponse = options.onResponse;
   }
 
@@ -274,6 +282,11 @@ export class TenergyClient {
       auth: options.bootstrapToken === undefined ? 'api-key' : 'bootstrap',
       bootstrapToken: options.bootstrapToken,
     });
+  }
+
+  /** The service fee this account pays now and the spend that sets it. */
+  getAccountFee(): Promise<ResponseOf<'getAccountFee'>> {
+    return this.call('GET', '/account/fee', {});
   }
 
   getBalance(): Promise<ResponseOf<'getBalance'>> {
@@ -330,6 +343,23 @@ export class TenergyClient {
   /** Accepts our order id, or `cid:<client_order_id>` (openapi `getOrder`). */
   getOrder(orderId: string): Promise<ResponseOf<'getOrder'>> {
     return this.call('GET', `/orders/${encodeURIComponent(orderId)}`, {});
+  }
+
+  /** Restore a receiver's used energy or bandwidth now (openapi `createRefill`); charged from the balance. */
+  createRefill(
+    body: RequestBodyOf<'createRefill'>,
+    options: { idempotencyKey?: string } = {},
+  ): Promise<ResponseOf<'createRefill'>> {
+    return this.call('POST', '/refills', { body, idempotencyKey: options.idempotencyKey });
+  }
+
+  listRefills(query?: QueryOf<'listRefills'>): Promise<ResponseOf<'listRefills'>> {
+    return this.call('GET', '/refills', { query });
+  }
+
+  /** Accepts our refill id, or `cid:<client_order_id>`. */
+  getRefill(refillId: string): Promise<ResponseOf<'getRefill'>> {
+    return this.call('GET', `/refills/${encodeURIComponent(refillId)}`, {});
   }
 
   reclaimOrder(
@@ -451,6 +481,26 @@ export class TenergyClient {
     return this.call('GET', '/market/summary', { query, auth: 'optional' });
   }
 
+  /** Our price and the market's by UTC hour over 1 / 7 / 30 days, merged into labelled windows; anonymous. */
+  getMarketHourlyPattern(query?: QueryOf<'getMarketHourlyPattern'>): Promise<ResponseOf<'getMarketHourlyPattern'>> {
+    return this.call('GET', '/market/hourly-pattern', { query, auth: 'optional' });
+  }
+
+  /** One point per UTC day over the last `days`: our price and the market's; anonymous. */
+  getMarketDaily(query?: QueryOf<'getMarketDaily'>): Promise<ResponseOf<'getMarketDaily'>> {
+    return this.call('GET', '/market/daily', { query, auth: 'optional' });
+  }
+
+  /** What renting on JustLend DAO really costs: rent rate, the owner's energy share, call costs; anonymous. */
+  getMarketJustLend(): Promise<ResponseOf<'getMarketJustLend'>> {
+    return this.call('GET', '/market/justlend', { auth: 'optional' });
+  }
+
+  /** The service-fee tiers in force (by 30-day spend); anonymous. */
+  getServiceFees(): Promise<ResponseOf<'getServiceFees'>> {
+    return this.call('GET', '/fees', { auth: 'none' });
+  }
+
   /** Service status: api, database, payments, delivery, supply; anonymous. */
   getStatus(): Promise<ResponseOf<'getStatus'>> {
     return this.call('GET', '/status', { auth: 'none' });
@@ -488,6 +538,11 @@ export class TenergyClient {
 
   getAddressResources(address: string): Promise<ResponseOf<'getAddressResources'>> {
     return this.call('GET', `/resources/${encodeURIComponent(address)}`, { auth: 'optional' });
+  }
+
+  /** Energy and bandwidth this address used and burned on its own transactions, per UTC day (`days` 7 or 30). */
+  getAddressUsage(address: string, query?: QueryOf<'getAddressUsage'>): Promise<ResponseOf<'getAddressUsage'>> {
+    return this.call('GET', `/resources/${encodeURIComponent(address)}/usage`, { query, auth: 'optional' });
   }
 
   estimateTransferEnergy(
@@ -679,6 +734,7 @@ export class TenergyClient {
       return headers;
     }
     if (auth === 'none') return headers;
+    if (this.authHeaders !== undefined) return { ...headers, ...this.authHeaders };
     if (auth === 'optional' && (this.apiKey === undefined || this.apiSecret === undefined)) return headers;
 
     if (this.apiKey === undefined || this.apiSecret === undefined) {
